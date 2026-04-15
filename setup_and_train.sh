@@ -1,288 +1,106 @@
-"""
-Fine-tune google/gemma-4-E4B-it on a local VM using legislation.jsonl
-Dataset format expected (one JSON object per line):
-  {"text": "..."}                          # pre-formatted plain text
-  OR
-  {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
-  OR
-  {"prompt": "...", "completion": "..."}   # prompt/completion pairs
+#!/usr/bin/env bash
+# =============================================================================
+# Fine-tune Gemma on a legal JSONL dataset on a fresh H100 VM.
+#
+# Usage:
+#   chmod +x setup_and_train.sh
+#   ./setup_and_train.sh
+#
+# What this does:
+#   1. Installs system packages (build tools, git, python)
+#   2. Verifies NVIDIA driver + CUDA is visible
+#   3. Creates a Python venv and installs PyTorch (cu121) + HF stack
+#   4. (Optional) installs flash-attn for speed on H100
+#   5. Logs in to Hugging Face (Gemma is gated - you need a token)
+#   6. Runs the training script on legislation.jsonl
+#
+# Expected layout in the working dir:
+#   setup_and_train.sh          (this file)
+#   train_gemma.py              (created below by this script if missing)
+#   legislation.jsonl           (your dataset)
+# =============================================================================
 
-Requirements:
-  pip install "torch>=2.3" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-  pip install "transformers[chat_template]>=5.5.0" "trl>=1.0.0" "datasets>=3.0" accelerate peft bitsandbytes
-"""
+set -euo pipefail
 
-import json
-import os
-import logging
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional
+# ---- user-configurable ------------------------------------------------------
+# NOTE: Unsloth's notebook calls it "gemma-4-E4B" but on HF the real model id
+# for the E4B checkpoint is google/gemma-3n-E4B (Gemma 3n family). Swap to
+# whichever id you have access to.
+MODEL_ID="${MODEL_ID:-google/gemma-3n-E4B-it}"
+DATA_PATH="${DATA_PATH:-$(pwd)/legislation.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/gemma-legal-lora}"
+VENV_DIR="${VENV_DIR:-$(pwd)/.venv}"
+HF_TOKEN="${HF_TOKEN:-}"   # export HF_TOKEN=hf_xxx before running, or paste below
+# -----------------------------------------------------------------------------
 
-import torch
-from datasets import Dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    HfArgumentParser,
-)
-from peft import LoraConfig, get_peft_model
-from trl import SFTConfig, SFTTrainer
+echo "==> 1/6  System packages"
+sudo apt-get update -y
+sudo apt-get install -y --no-install-recommends \
+    build-essential git curl ca-certificates \
+    python3 python3-venv python3-pip python3-dev \
+    ninja-build pkg-config
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-logger = logging.getLogger(__name__)
+echo "==> 2/6  GPU check"
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "!! nvidia-smi not found. This script assumes the VM image already"
+    echo "   ships with NVIDIA drivers (most H100 cloud images do)."
+    echo "   If not, install drivers first (e.g. 'sudo ubuntu-drivers install')"
+    echo "   and reboot before rerunning."
+    exit 1
+fi
+nvidia-smi | head -20
 
+echo "==> 3/6  Python venv + PyTorch (CUDA 12.1)"
+python3 -m venv "$VENV_DIR"
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+python -m pip install --upgrade pip wheel setuptools
 
-# ---------------------------------------------------------------------------
-# Arguments
-# ---------------------------------------------------------------------------
+# Torch built against CUDA 12.1 — works on H100 (compute cap 9.0)
+pip install --index-url https://download.pytorch.org/whl/cu121 \
+    torch==2.4.1 torchvision==0.19.1
 
-@dataclass
-class ScriptArguments:
-    model_id: str = field(
-        default="google/gemma-4-E4B-it",
-        metadata={"help": "HuggingFace model id or local path"},
-    )
-    dataset_path: str = field(
-        default="legislation.jsonl",
-        metadata={"help": "Path to the JSONL dataset file"},
-    )
-    output_dir: str = field(
-        default="./gemma4-legislation-ft",
-        metadata={"help": "Directory to save checkpoints and final model"},
-    )
-    hf_token: Optional[str] = field(
-        default=None,
-        metadata={"help": "HuggingFace token (or set HF_TOKEN env var)"},
-    )
+pip install \
+    "transformers>=4.45,<4.50" \
+    "accelerate>=0.34" \
+    "peft>=0.13" \
+    "trl>=0.11" \
+    "datasets>=3.0" \
+    "bitsandbytes>=0.44" \
+    "sentencepiece" "protobuf" "einops" "safetensors" \
+    "huggingface_hub[cli]>=0.25"
 
-    # LoRA
-    use_lora: bool = field(default=True, metadata={"help": "Use LoRA (recommended for limited VRAM)"})
-    lora_r: int = field(default=16, metadata={"help": "LoRA rank"})
-    lora_alpha: int = field(default=32, metadata={"help": "LoRA alpha"})
-    lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
+echo "==> 4/6  (optional) flash-attn 2 for H100 speedup"
+# Skipping flash-attn if it fails to build is fine; training still works.
+pip install --no-build-isolation "flash-attn==2.6.3" || \
+    echo "   flash-attn build skipped — training will fall back to SDPA"
 
-    # Quantisation
-    load_in_4bit: bool = field(default=False, metadata={"help": "Load model in 4-bit (QLoRA)"})
-    load_in_8bit: bool = field(default=False, metadata={"help": "Load model in 8-bit"})
+echo "==> 5/6  Hugging Face login (Gemma is a gated model)"
+if [[ -n "$HF_TOKEN" ]]; then
+    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+else
+    echo "   HF_TOKEN not set. Launching interactive login — paste your token:"
+    huggingface-cli login
+fi
 
-    # Training
-    num_train_epochs: int = field(default=3)
-    per_device_train_batch_size: int = field(default=2)
-    gradient_accumulation_steps: int = field(default=4)
-    learning_rate: float = field(default=5e-6)
-    max_seq_length: int = field(default=2048)
-    logging_steps: int = field(default=10)
-    save_steps: int = field(default=100)
-    warmup_ratio: float = field(default=0.03)
-    bf16: bool = field(default=True, metadata={"help": "Use bfloat16 (requires Ampere+ GPU)"})
-    fp16: bool = field(default=False, metadata={"help": "Use fp16 (fallback for older GPUs)"})
-    freeze_vision_audio: bool = field(
-        default=True,
-        metadata={"help": "Freeze vision/audio towers (text-only fine-tuning)"},
-    )
+echo "==> 6/6  Sanity checks"
+[[ -f "$DATA_PATH" ]] || { echo "!! dataset not found at $DATA_PATH"; exit 1; }
+[[ -f "$(pwd)/train_gemma.py" ]] || { echo "!! train_gemma.py missing in cwd"; exit 1; }
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 
+echo
+echo "==> Starting fine-tune"
+echo "    model : $MODEL_ID"
+echo "    data  : $DATA_PATH"
+echo "    out   : $OUTPUT_DIR"
+echo
 
-# ---------------------------------------------------------------------------
-# Dataset loading
-# ---------------------------------------------------------------------------
+# Single-GPU H100. For multi-GPU, prefix with:
+#   accelerate launch --num_processes <N>
+python train_gemma.py \
+    --model_id "$MODEL_ID" \
+    --data_path "$DATA_PATH" \
+    --output_dir "$OUTPUT_DIR"
 
-def load_jsonl(path: str) -> Dataset:
-    """Load a JSONL file and normalise it to a single 'text' column."""
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Skipping line {line_no}: {e}")
-                continue
-            records.append(obj)
-
-    logger.info(f"Loaded {len(records)} records from {path}")
-
-    if not records:
-        raise ValueError(f"No valid records found in {path}")
-
-    # Detect format from first record
-    sample = records[0]
-    keys = set(sample.keys())
-
-    if "text" in keys:
-        # Already formatted
-        texts = [r["text"] for r in records if "text" in r]
-    elif "messages" in keys:
-        # Chat-format — will be handled by apply_chat_template in SFTTrainer
-        return Dataset.from_list(records)
-    elif "prompt" in keys and "completion" in keys:
-        texts = [r["prompt"] + r["completion"] for r in records]
-    elif "instruction" in keys and "output" in keys:
-        # Alpaca-style
-        context = lambda r: f"\n\n### Input:\n{r['input']}" if r.get("input") else ""
-        texts = [
-            f"### Instruction:\n{r['instruction']}{context(r)}\n\n### Response:\n{r['output']}"
-            for r in records
-        ]
-    else:
-        # Best-effort: concatenate all string values
-        logger.warning(
-            f"Unrecognised schema (keys: {keys}). "
-            "Concatenating all string values — check your JSONL format."
-        )
-        texts = [" ".join(str(v) for v in r.values() if isinstance(v, str)) for r in records]
-
-    return Dataset.from_dict({"text": texts})
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = HfArgumentParser(ScriptArguments)
-    args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
-
-    # HF token
-    token = args.hf_token or os.environ.get("HF_TOKEN")
-    if token:
-        os.environ["HF_TOKEN"] = token
-        logger.info("HuggingFace token set.")
-    else:
-        logger.warning(
-            "No HF_TOKEN provided. If google/gemma-4-E4B-it is gated you will need one. "
-            "Pass --hf_token <TOKEN> or set the HF_TOKEN env var."
-        )
-
-    # ------------------------------------------------------------------ #
-    # Dataset
-    # ------------------------------------------------------------------ #
-    logger.info(f"Loading dataset from {args.dataset_path} …")
-    dataset = load_jsonl(args.dataset_path)
-    logger.info(f"Dataset: {dataset}")
-
-    # ------------------------------------------------------------------ #
-    # Tokenizer
-    # ------------------------------------------------------------------ #
-    logger.info(f"Loading tokenizer for {args.model_id} …")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_id,
-        trust_remote_code=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # ------------------------------------------------------------------ #
-    # Model
-    # ------------------------------------------------------------------ #
-    logger.info(f"Loading model {args.model_id} …")
-
-    quant_kwargs = {}
-    if args.load_in_4bit:
-        from transformers import BitsAndBytesConfig
-        quant_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-        logger.info("Using 4-bit quantisation (QLoRA).")
-    elif args.load_in_8bit:
-        from transformers import BitsAndBytesConfig
-        quant_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        logger.info("Using 8-bit quantisation.")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-        **quant_kwargs,
-    )
-
-    # Freeze vision / audio towers so we only update text weights
-    if args.freeze_vision_audio:
-        frozen = 0
-        for name, param in model.named_parameters():
-            if not name.startswith("model.language_model"):
-                param.requires_grad = False
-                frozen += 1
-        logger.info(f"Froze {frozen} non-language parameter tensors (vision/audio towers).")
-
-    # ------------------------------------------------------------------ #
-    # LoRA
-    # ------------------------------------------------------------------ #
-    if args.use_lora:
-        lora_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            # Target the attention + MLP projection layers in the language model
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
-
-    # ------------------------------------------------------------------ #
-    # Training config
-    # ------------------------------------------------------------------ #
-    sft_config = SFTConfig(
-        output_dir=args.output_dir,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        learning_rate=args.learning_rate,
-        lr_scheduler_type="cosine",
-        warmup_ratio=args.warmup_ratio,
-        bf16=args.bf16,
-        fp16=args.fp16,
-        optim="adamw_torch_fused",
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=2,
-        max_seq_length=args.max_seq_length,
-        packing=False,
-        use_liger_kernel=False,   # Disabled — can cause CUDA illegal access on Gemma 4
-        dataset_text_field="text" if "text" in dataset.column_names else None,
-        report_to="none",
-    )
-
-    # ------------------------------------------------------------------ #
-    # Trainer
-    # ------------------------------------------------------------------ #
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_config,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-    )
-
-    logger.info("Starting training …")
-    train_result = trainer.train()
-
-    logger.info(f"Training complete. Metrics: {train_result.metrics}")
-
-    # Save final model + tokenizer
-    logger.info(f"Saving model to {args.output_dir} …")
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-
-    logger.info("Done! Fine-tuned model saved to: %s", args.output_dir)
-
-
-if __name__ == "__main__":
-    main()
+echo
+echo "==> Done. LoRA adapters saved to $OUTPUT_DIR"
