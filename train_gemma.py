@@ -1,160 +1,287 @@
 """
-Fine-tune Gemma on a JSONL legal dataset using HF transformers + PEFT + TRL.
-No unsloth. Assumes a single H100 (80GB) but works on any >=24GB card with
-4-bit loading.
+Fine-tune google/gemma-4-E4B-it on a local VM using legislation.jsonl
+Dataset format expected (one JSON object per line):
+  {"text": "..."}                          # pre-formatted plain text
+  OR
+  {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+  OR
+  {"prompt": "...", "completion": "..."}   # prompt/completion pairs
 
-Input format: one JSON object per line. This script looks for a `text` field
-(the format produced by scrape_legislation.py). If your records use a
-different key, pass --text_field.
+Requirements:
+  pip install "torch>=2.3" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+  pip install "transformers[chat_template]>=5.5.0" "trl>=1.0.0" "datasets>=3.0" accelerate peft bitsandbytes
 """
 
-import argparse
+import json
 import os
-from dataclasses import dataclass
+import logging
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
-from datasets import load_dataset
-from peft import LoraConfig
+from datasets import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
+    HfArgumentParser,
 )
+from peft import LoraConfig, get_peft_model
 from trl import SFTConfig, SFTTrainer
 
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_id", required=True)
-    p.add_argument("--data_path", required=True, help="path to .jsonl")
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("--text_field", default="text")
-    p.add_argument("--max_seq_length", type=int, default=2048)
-    p.add_argument("--num_train_epochs", type=float, default=1.0)
-    p.add_argument("--per_device_batch_size", type=int, default=1)
-    p.add_argument("--grad_accum", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=2e-4)
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
-    p.add_argument("--load_in_4bit", action="store_true", default=True)
-    p.add_argument("--no_4bit", dest="load_in_4bit", action="store_false")
-    return p.parse_args()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
-def build_dataset(path: str, text_field: str):
-    ds = load_dataset("json", data_files=path, split="train")
-    # Keep only non-empty text rows. scrape_legislation.py produced some
-    # metadata-only rows with empty `text` — drop those.
-    if text_field not in ds.column_names:
-        raise ValueError(
-            f"field '{text_field}' not in dataset columns {ds.column_names}"
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScriptArguments:
+    model_id: str = field(
+        default="google/gemma-4-E4B-it",
+        metadata={"help": "HuggingFace model id or local path"},
+    )
+    dataset_path: str = field(
+        default="legislation.jsonl",
+        metadata={"help": "Path to the JSONL dataset file"},
+    )
+    output_dir: str = field(
+        default="./gemma4-legislation-ft",
+        metadata={"help": "Directory to save checkpoints and final model"},
+    )
+    hf_token: Optional[str] = field(
+        default=None,
+        metadata={"help": "HuggingFace token (or set HF_TOKEN env var)"},
+    )
+
+    # LoRA
+    use_lora: bool = field(default=True, metadata={"help": "Use LoRA (recommended for limited VRAM)"})
+    lora_r: int = field(default=16, metadata={"help": "LoRA rank"})
+    lora_alpha: int = field(default=32, metadata={"help": "LoRA alpha"})
+    lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
+
+    # Quantisation
+    load_in_4bit: bool = field(default=False, metadata={"help": "Load model in 4-bit (QLoRA)"})
+    load_in_8bit: bool = field(default=False, metadata={"help": "Load model in 8-bit"})
+
+    # Training
+    num_train_epochs: int = field(default=3)
+    per_device_train_batch_size: int = field(default=2)
+    gradient_accumulation_steps: int = field(default=4)
+    learning_rate: float = field(default=5e-6)
+    max_seq_length: int = field(default=2048)
+    logging_steps: int = field(default=10)
+    save_steps: int = field(default=100)
+    warmup_ratio: float = field(default=0.03)
+    bf16: bool = field(default=True, metadata={"help": "Use bfloat16 (requires Ampere+ GPU)"})
+    fp16: bool = field(default=False, metadata={"help": "Use fp16 (fallback for older GPUs)"})
+    freeze_vision_audio: bool = field(
+        default=True,
+        metadata={"help": "Freeze vision/audio towers (text-only fine-tuning)"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading
+# ---------------------------------------------------------------------------
+
+def load_jsonl(path: str) -> Dataset:
+    """Load a JSONL file and normalise it to a single 'text' column."""
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Skipping line {line_no}: {e}")
+                continue
+            records.append(obj)
+
+    logger.info(f"Loaded {len(records)} records from {path}")
+
+    if not records:
+        raise ValueError(f"No valid records found in {path}")
+
+    # Detect format from first record
+    sample = records[0]
+    keys = set(sample.keys())
+
+    if "text" in keys:
+        # Already formatted
+        texts = [r["text"] for r in records if "text" in r]
+    elif "messages" in keys:
+        # Chat-format — will be handled by apply_chat_template in SFTTrainer
+        return Dataset.from_list(records)
+    elif "prompt" in keys and "completion" in keys:
+        texts = [r["prompt"] + r["completion"] for r in records]
+    elif "instruction" in keys and "output" in keys:
+        # Alpaca-style
+        context = lambda r: f"\n\n### Input:\n{r['input']}" if r.get("input") else ""
+        texts = [
+            f"### Instruction:\n{r['instruction']}{context(r)}\n\n### Response:\n{r['output']}"
+            for r in records
+        ]
+    else:
+        # Best-effort: concatenate all string values
+        logger.warning(
+            f"Unrecognised schema (keys: {keys}). "
+            "Concatenating all string values — check your JSONL format."
         )
-    ds = ds.filter(lambda r: isinstance(r[text_field], str) and len(r[text_field]) > 50)
+        texts = [" ".join(str(v) for v in r.values() if isinstance(v, str)) for r in records]
 
-    # Rename to 'text' so SFTTrainer's dataset_text_field='text' just works.
-    if text_field != "text":
-        ds = ds.rename_column(text_field, "text")
+    return Dataset.from_dict({"text": texts})
 
-    # Keep only the text column — SFTTrainer does not need the rest.
-    drop = [c for c in ds.column_names if c != "text"]
-    if drop:
-        ds = ds.remove_columns(drop)
-    print(f"dataset rows after filtering: {len(ds)}")
-    return ds
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    args = parse_args()
+    parser = HfArgumentParser(ScriptArguments)
+    args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
 
-    # ---- tokenizer ----------------------------------------------------------
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # ---- model (4-bit, nf4) -------------------------------------------------
-    bnb = None
-    if args.load_in_4bit:
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
+    # HF token
+    token = args.hf_token or os.environ.get("HF_TOKEN")
+    if token:
+        os.environ["HF_TOKEN"] = token
+        logger.info("HuggingFace token set.")
+    else:
+        logger.warning(
+            "No HF_TOKEN provided. If google/gemma-4-E4B-it is gated you will need one. "
+            "Pass --hf_token <TOKEN> or set the HF_TOKEN env var."
         )
 
-    attn_impl = "flash_attention_2"
-    try:
-        import flash_attn  # noqa: F401
-    except Exception:
-        attn_impl = "sdpa"
-    print(f"attention impl: {attn_impl}")
+    # ------------------------------------------------------------------ #
+    # Dataset
+    # ------------------------------------------------------------------ #
+    logger.info(f"Loading dataset from {args.dataset_path} …")
+    dataset = load_jsonl(args.dataset_path)
+    logger.info(f"Dataset: {dataset}")
+
+    # ------------------------------------------------------------------ #
+    # Tokenizer
+    # ------------------------------------------------------------------ #
+    logger.info(f"Loading tokenizer for {args.model_id} …")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # ------------------------------------------------------------------ #
+    # Model
+    # ------------------------------------------------------------------ #
+    logger.info(f"Loading model {args.model_id} …")
+
+    quant_kwargs = {}
+    if args.load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        quant_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        logger.info("Using 4-bit quantisation (QLoRA).")
+    elif args.load_in_8bit:
+        from transformers import BitsAndBytesConfig
+        quant_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        logger.info("Using 8-bit quantisation.")
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        quantization_config=bnb,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
         device_map="auto",
-        attn_implementation=attn_impl,
         trust_remote_code=True,
-    )
-    model.config.use_cache = False
-    model.config.pretraining_tp = 1
-
-    # ---- LoRA ---------------------------------------------------------------
-    # Target the attention + MLP linear layers. Names below are the Gemma
-    # family convention and also match most Llama-style models.
-    lora = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        attn_implementation="sdpa",
+        **quant_kwargs,
     )
 
-    # ---- data ---------------------------------------------------------------
-    train_ds = build_dataset(args.data_path, args.text_field)
+    # Freeze vision / audio towers so we only update text weights
+    if args.freeze_vision_audio:
+        frozen = 0
+        for name, param in model.named_parameters():
+            if not name.startswith("model.language_model"):
+                param.requires_grad = False
+                frozen += 1
+        logger.info(f"Froze {frozen} non-language parameter tensors (vision/audio towers).")
 
-    # ---- trainer ------------------------------------------------------------
-    sft_cfg = SFTConfig(
+    # ------------------------------------------------------------------ #
+    # LoRA
+    # ------------------------------------------------------------------ #
+    if args.use_lora:
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            # Target the attention + MLP projection layers in the language model
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+    # ------------------------------------------------------------------ #
+    # Training config
+    # ------------------------------------------------------------------ #
+    sft_config = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.learning_rate,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        weight_decay=0.0,
-        optim="paged_adamw_8bit",
-        bf16=True,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=5,
-        save_strategy="steps",
-        save_steps=200,
+        learning_rate=args.learning_rate,
+        lr_scheduler_type="cosine",
+        warmup_ratio=args.warmup_ratio,
+        bf16=args.bf16,
+        fp16=args.fp16,
+        optim="adamw_torch_fused",
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
         save_total_limit=2,
-        report_to="none",
         max_seq_length=args.max_seq_length,
-        packing=True,              # pack multiple samples per seq — good for long docs
-        dataset_text_field="text",
+        packing=False,
+        use_liger_kernel=False,   # Disabled — can cause CUDA illegal access on Gemma 4
+        dataset_text_field="text" if "text" in dataset.column_names else None,
+        report_to="none",
     )
 
+    # ------------------------------------------------------------------ #
+    # Trainer
+    # ------------------------------------------------------------------ #
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_ds,
-        args=sft_cfg,
-        peft_config=lora,
+        args=sft_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
     )
 
-    trainer.train()
+    logger.info("Starting training …")
+    train_result = trainer.train()
 
-    # ---- save ---------------------------------------------------------------
+    logger.info(f"Training complete. Metrics: {train_result.metrics}")
+
+    # Save final model + tokenizer
+    logger.info(f"Saving model to {args.output_dir} …")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"saved adapters + tokenizer to {args.output_dir}")
+
+    logger.info("Done! Fine-tuned model saved to: %s", args.output_dir)
 
 
 if __name__ == "__main__":
