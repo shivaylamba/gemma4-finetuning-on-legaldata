@@ -1,4 +1,4 @@
-# Legaltech — UK legislation fine-tuning and API
+# Finetuning a Gemma 4 Model with Legal Data
 
 This repository fine-tunes a **Gemma** family model (default: `google/gemma-4-E4B`) on **UK legislation** using **LoRA**, serves inference with **vLLM** (OpenAI-compatible), and exposes a small **FastAPI** layer with legal-focused routes. Optional **Cloudflare quick tunnels** expose the API over HTTPS without opening firewall ports.
 
