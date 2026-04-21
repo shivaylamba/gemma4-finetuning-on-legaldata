@@ -21,8 +21,8 @@ safetensors==0.5.3
 huggingface_hub[cli]==0.30.2
 
 # --- Tokeniser / model extras -----------------------------------------------
-sentencepiece==0.2.0
-protobuf==5.29.4
+sentencepiece==0.2.1
+protobuf==5.29.6
 einops==0.8.1
 
 # --- Optional: Flash Attention 2 (H100 speedup) -----------------------------
