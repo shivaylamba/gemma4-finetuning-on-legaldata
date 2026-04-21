@@ -1,6 +1,8 @@
 """
-Fine-tune google/gemma-4-E4B-it on a local VM using legislation.jsonl
-Dataset format expected (one JSON object per line):
+Fine-tune google/gemma-4-E4B on a local VM using legislation JSONL.
+Default dataset is legislation_qa_clean.jsonl (curated chat Q&A, ~160 rows).
+
+Dataset format (one JSON object per line):
   {"text": "..."}                          # pre-formatted plain text
   OR
   {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
@@ -43,15 +45,18 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ScriptArguments:
     model_id: str = field(
-        default="google/gemma-4-E4B-it",
+        default="google/gemma-4-E4B",
         metadata={"help": "HuggingFace model id or local path"},
     )
     dataset_path: str = field(
-        default="legislation.jsonl",
-        metadata={"help": "Path to the JSONL dataset file"},
+        default="legislation_qa_clean.jsonl",
+        metadata={
+            "help": "Path to the JSONL dataset file",
+            "aliases": ["--data_path"],
+        },
     )
     output_dir: str = field(
-        default="./gemma4-legislation-ft",
+        default="./gemma-legal-qa-clean-lora",
         metadata={"help": "Directory to save checkpoints and final model"},
     )
     hf_token: Optional[str] = field(
@@ -69,14 +74,28 @@ class ScriptArguments:
     load_in_4bit: bool = field(default=False, metadata={"help": "Load model in 4-bit (QLoRA)"})
     load_in_8bit: bool = field(default=False, metadata={"help": "Load model in 8-bit"})
 
-    # Training
-    num_train_epochs: int = field(default=3)
-    per_device_train_batch_size: int = field(default=2)
-    gradient_accumulation_steps: int = field(default=4)
-    learning_rate: float = field(default=5e-6)
-    max_seq_length: int = field(default=2048)
-    logging_steps: int = field(default=10)
-    save_steps: int = field(default=100)
+    # Training — defaults tuned for a small curated Q&A set (~160 rows, short answers)
+    num_train_epochs: int = field(default=5)
+    per_device_train_batch_size: int = field(
+        default=1,
+        metadata={"help": "Use 1 if you share the GPU or hit OOM at long sequence lengths."},
+    )
+    gradient_accumulation_steps: int = field(
+        default=4,
+        metadata={"help": "Effective batch = per_device_train_batch_size * this (default 1×4=4)."},
+    )
+    learning_rate: float = field(
+        default=1e-4,
+        metadata={"help": "LoRA-friendly default; bump up for even smaller datasets."},
+    )
+    max_seq_length: int = field(
+        default=1024,
+        metadata={
+            "help": "Rows in legislation_qa_clean.jsonl are short; 1024 fits all of them with headroom.",
+        },
+    )
+    logging_steps: int = field(default=5)
+    save_steps: int = field(default=50)
     warmup_ratio: float = field(default=0.03)
     bf16: bool = field(default=True, metadata={"help": "Use bfloat16 (requires Ampere+ GPU)"})
     fp16: bool = field(default=False, metadata={"help": "Use fp16 (fallback for older GPUs)"})
@@ -178,6 +197,39 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # Conversational JSONL (e.g. legislation_qa.jsonl) needs a Jinja chat template; base Gemma checkpoints
+    # often ship without tokenizer.chat_template.
+    if "messages" in dataset.column_names and not tokenizer.chat_template:
+        template_path = Path(__file__).resolve().parent / "chat_template.jinja"
+        if template_path.is_file():
+            tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+            logger.info("Set tokenizer.chat_template from %s", template_path)
+        else:
+            raise ValueError(
+                f"Dataset has `messages` but tokenizer has no chat_template and {template_path} is missing. "
+                "Add chat_template.jinja (same file used for vLLM serving) or use an instruct model_id."
+            )
+
+    # Render chat to a single text column here so TRL does not re-apply the template in dataset workers
+    # (workers do not see tokenizer.chat_template set in-process).
+    if "messages" in dataset.column_names:
+
+        def _messages_to_text(batch: dict) -> dict:
+            texts = [
+                tokenizer.apply_chat_template(msgs, tokenize=False)
+                for msgs in batch["messages"]
+            ]
+            return {"text": texts}
+
+        dataset = dataset.map(
+            _messages_to_text,
+            batched=True,
+            batch_size=32,
+            remove_columns=["messages"],
+            desc="messages → text (chat template)",
+        )
+        logger.info("Dataset after rendering: %s", dataset)
+
     # ------------------------------------------------------------------ #
     # Model
     # ------------------------------------------------------------------ #
@@ -226,13 +278,14 @@ def main():
             lora_dropout=args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
-            # Target the attention + MLP projection layers in the language model
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
+            # Target only language-model projection modules (skip vision/audio wrappers).
+            target_modules=(
+                r"^model\.language_model\.layers\.\d+\."
+                r"(self_attn\.(q_proj|k_proj|v_proj|o_proj)|"
+                r"mlp\.(gate_proj|up_proj|down_proj))$"
+            ),
         )
-        model = get_peft_model(model, lora_config)
+        model = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
         model.print_trainable_parameters()
 
     # ------------------------------------------------------------------ #
@@ -257,7 +310,8 @@ def main():
         max_seq_length=args.max_seq_length,
         packing=False,
         use_liger_kernel=False,   # Disabled — can cause CUDA illegal access on Gemma 4
-        dataset_text_field="text" if "text" in dataset.column_names else None,
+        # After conversational prep, TRL stores tokenized strings in column "text"
+        dataset_text_field="text",
         report_to="none",
     )
 
