@@ -337,3 +337,9 @@ curl -s https://YOUR-SUBDOMAIN.trycloudflare.com/health
 - **OOM during training**: use `--load_in_4bit`, reduce `--max_seq_length` or `--per_device_train_batch_size`, or increase `--gradient_accumulation_steps`.
 - **vLLM won’t start**: ensure `merge_lora.py` was run and `MODEL_PATH` (or default `./gemma-legal-qa-clean-merged`) contains `config.json`.
 - **FastAPI `/health` fails**: confirm vLLM is up: `curl -s http://localhost:8100/v1/models`.
+
+--- 
+
+## VM Details
+<img width="1493" height="269" alt="image" src="https://github.com/user-attachments/assets/a7fa5103-fbb0-49a7-93d8-32a23d1fe87b" />
+
