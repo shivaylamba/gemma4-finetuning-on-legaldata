@@ -14,6 +14,9 @@
         {{- message['content'] | trim -}}
     {%- endif -%}
     {{- '<turn|>\n' -}}
+    {%- if message['role'] == 'assistant' -%}
+        {{- eos_token -}}
+    {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
     {{- '<|turn>model\n' -}}
