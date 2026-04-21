@@ -11,6 +11,8 @@ This repository fine-tunes a **Gemma** family model (default: `google/gemma-4-E4
 3. **Inference**: After training, you **merge** the adapter into the base weights with `merge_lora.py` so **vLLM** can load a single full-precision checkpoint.
 4. **API**: `api.py` proxies to vLLM, adds a default UK-legislation system prompt, and applies light post-processing to reduce question-echo artifacts.
 
+<img width="863" height="466" alt="image" src="https://github.com/user-attachments/assets/73cd162d-7021-4ab6-a898-1b9600aef839" />
+
 ---
 
 ## How it works (architecture)
