@@ -47,6 +47,12 @@ USER_QUERY_PREFIX = os.getenv("USER_QUERY_PREFIX", "")
 FREQUENCY_PENALTY = float(os.getenv("FREQUENCY_PENALTY", "0.35"))
 PRESENCE_PENALTY = float(os.getenv("PRESENCE_PENALTY", "0.15"))
 
+# CORS allowed origins. Set CORS_ORIGINS to a comma-separated list of origins to restrict access
+# (e.g. "https://myapp.example.com,https://staging.example.com").
+# Defaults to localhost only; set to "*" only if the API is on a fully private network.
+_cors_origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+CORS_ORIGINS: list[str] = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+
 
 def _strip_instruction_echo(text: str, prefix: str) -> str:
     if not prefix or not text:
@@ -139,7 +145,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -212,8 +218,12 @@ async def analyze(req: AnalyzeRequest):
 
     Wraps the query with a legal system prompt and returns a structured response.
     Supports optional SSE streaming when `stream=true`.
+
+    Note: when `stream=true` the echo-stripping post-processing applied to
+    non-streaming responses is not performed (tokens arrive one at a time).
     """
-    assert client is not None
+    if client is None:
+        raise HTTPException(status_code=503, detail="LLM client not initialised.")
 
     system = req.system_prompt or LEGAL_SYSTEM_PROMPT
     prefix = USER_QUERY_PREFIX
@@ -257,8 +267,12 @@ async def chat(req: ChatRequest):
 
     Accepts an arbitrary message list (system/user/assistant turns).
     Supports optional SSE streaming when `stream=true`.
+
+    Note: when `stream=true` the echo-stripping post-processing applied to
+    non-streaming responses is not performed (tokens arrive one at a time).
     """
-    assert client is not None
+    if client is None:
+        raise HTTPException(status_code=503, detail="LLM client not initialised.")
 
     messages = [m.model_dump() for m in req.messages]
 
@@ -302,8 +316,14 @@ async def _stream_chat(
     max_tokens: int,
     temperature: float,
 ) -> AsyncIterator[str]:
-    """Yield SSE-formatted chunks from the vLLM streaming response."""
-    assert client is not None
+    """Yield SSE-formatted chunks from the vLLM streaming response.
+
+    Note: echo-stripping (_strip_echoed_query etc.) is intentionally skipped here
+    because tokens arrive incrementally and cannot be inspected as a whole until
+    the stream ends.  If echo removal is critical, use the non-streaming endpoints.
+    """
+    if client is None:
+        raise HTTPException(status_code=503, detail="LLM client not initialised.")
 
     stream = await client.chat.completions.create(
         model=MODEL_NAME,

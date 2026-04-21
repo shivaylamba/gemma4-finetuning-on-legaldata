@@ -60,7 +60,9 @@ def split_sentences(text: str, max_sentences: int = 6) -> list[str]:
         p = p.strip()
         if not p:
             continue
-        if buf and len(buf) + 1 + len(p) < 12:
+        # Merge fragments shorter than 70 chars into the preceding sentence so that
+        # short clause tails (e.g. "as follows:—") don't become standalone sentences.
+        if buf and len(buf) + 1 + len(p) < 70:
             buf += " " + p
             continue
         if buf:
@@ -87,6 +89,29 @@ def summarising_answer(chunk: str, max_chars: int = 1200) -> str:
 def bullet_points_answer(chunk: str, max_items: int = 6) -> str:
     sents = split_sentences(chunk, max_sentences=max_items)
     return "\n".join(f"- {s.strip()}" for s in sents if len(s.strip()) > 20)
+
+
+_MODAL_RE = re.compile(r"\b(shall|must|may not|must not|is required|are required)\b", re.I)
+
+
+def extract_key_obligation(chunk: str, max_chars: int = 300) -> str:
+    """Return the shortest sentence containing a core obligation keyword (shall/must/may not).
+
+    Falls back to the first sentence if no modal verb is found.  This gives the
+    model a genuine extraction target instead of just echoing the full chunk.
+    """
+    sents = split_sentences(chunk, max_sentences=20)
+    for sent in sents:
+        if _MODAL_RE.search(sent):
+            s = sent.strip()
+            if len(s) > max_chars:
+                s = s[: max_chars - 3].rsplit(" ", 1)[0] + "..."
+            return s
+    # Fallback: first sentence
+    fallback = sents[0].strip() if sents else chunk[:max_chars]
+    if len(fallback) > max_chars:
+        fallback = fallback[: max_chars - 3].rsplit(" ", 1)[0] + "..."
+    return fallback
 
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
@@ -199,7 +224,7 @@ def iter_qa_rows(
             (
                 "quote_key",
                 "Identify the core obligation or rule expressed in this passage and quote the shortest phrase from the context that supports it.",
-                chunk[: min(900, len(chunk))] + ("..." if len(chunk) > 900 else ""),
+                extract_key_obligation(chunk),
             ),
         ]
 
@@ -214,6 +239,13 @@ def iter_qa_rows(
                 ],
                 "meta": {**base_meta, "kind": kind, "qa_index": qi},
             }
+
+
+def _normalize_for_dedup(messages: list[dict]) -> str:
+    """Produce a normalised key from the message list for duplicate detection."""
+    return " ".join(
+        m.get("content", "").strip().lower() for m in messages
+    )
 
 
 def main() -> None:
@@ -235,6 +267,9 @@ def main() -> None:
     args = ap.parse_args()
 
     written = 0
+    skipped_dupes = 0
+    seen: set[str] = set()
+
     with open(args.input, encoding="utf-8") as fin, open(
         args.output, "w", encoding="utf-8"
     ) as fout:
@@ -250,6 +285,11 @@ def main() -> None:
                 print(f"Skip line {di+1}: {e}")
                 continue
             for row in iter_qa_rows(rec, args.max_chunk_chars, args.overlap, di):
+                key = _normalize_for_dedup(row["messages"])
+                if key in seen:
+                    skipped_dupes += 1
+                    continue
+                seen.add(key)
                 if args.include_meta:
                     out = row
                 else:
@@ -257,7 +297,7 @@ def main() -> None:
                 fout.write(json.dumps(out, ensure_ascii=False) + "\n")
                 written += 1
 
-    print(f"Wrote {written} examples to {args.output}")
+    print(f"Wrote {written} examples to {args.output} ({skipped_dupes} duplicates skipped)")
 
 
 if __name__ == "__main__":

@@ -82,6 +82,10 @@ def main() -> None:
     log.info("Merging LoRA weights into base model …")
     model = model.merge_and_unload()
 
+    # Move to CPU before serialising to avoid GPU OOM when saving large shards.
+    log.info("Moving merged model to CPU for serialisation …")
+    model = model.to("cpu")
+
     log.info("Saving merged model to %s …", args.output_path)
     model.save_pretrained(args.output_path, safe_serialization=True)
     tokenizer.save_pretrained(args.output_path)

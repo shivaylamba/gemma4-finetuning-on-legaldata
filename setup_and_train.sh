@@ -66,20 +66,16 @@ python -m pip install --upgrade pip wheel setuptools
 pip install --index-url https://download.pytorch.org/whl/cu124 \
     torch==2.6.0 torchvision==0.21.0
 
-pip install \
-    "transformers==5.5.0" \
-    "accelerate>=0.34" \
-    "peft>=0.13" \
-    "trl>=0.11" \
-    "datasets>=3.0" \
-    "bitsandbytes>=0.44" \
-    "sentencepiece" "protobuf" "einops" "safetensors" \
-    "huggingface_hub[cli]>=0.25"
+# Install all remaining dependencies from the pinned requirements file so
+# that re-runs always use the same tested versions.
+SCRIPT_DIR_SETUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pip install -r "$SCRIPT_DIR_SETUP/requirements.txt"
 
 echo "==> 4/6  (optional) flash-attn 2 for H100 speedup"
-# Skipping flash-attn if it fails to build is fine; training still works.
-pip install --no-build-isolation "flash-attn>=2.7" || \
-    echo "   flash-attn build skipped — training will fall back to SDPA"
+# flash-attn is optional; training falls back to SDPA automatically when it
+# is not installed (train_gemma.py detects flash_attn at runtime).
+pip install --no-build-isolation "flash-attn==2.7.4" || \
+    echo "   flash-attn build skipped — training will use SDPA (see importlib detection in train_gemma.py)"
 
 echo "==> 5/6  Hugging Face login (Gemma is a gated model)"
 if [[ -n "$HF_TOKEN" ]]; then

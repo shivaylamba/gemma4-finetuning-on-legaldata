@@ -10,10 +10,10 @@ Dataset format (one JSON object per line):
   {"prompt": "...", "completion": "..."}   # prompt/completion pairs
 
 Requirements:
-  pip install "torch>=2.3" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-  pip install "transformers[chat_template]>=5.5.0" "trl>=1.0.0" "datasets>=3.0" accelerate peft bitsandbytes
+  See requirements.txt in this directory.
 """
 
+import importlib.util
 import json
 import os
 import logging
@@ -70,7 +70,7 @@ class ScriptArguments:
     lora_alpha: int = field(default=32, metadata={"help": "LoRA alpha"})
     lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
 
-    # Quantisation
+    # Quantisation — mutually exclusive: use at most one of these flags
     load_in_4bit: bool = field(default=False, metadata={"help": "Load model in 4-bit (QLoRA)"})
     load_in_8bit: bool = field(default=False, metadata={"help": "Load model in 8-bit"})
 
@@ -97,11 +97,31 @@ class ScriptArguments:
     logging_steps: int = field(default=5)
     save_steps: int = field(default=50)
     warmup_ratio: float = field(default=0.03)
+    weight_decay: float = field(
+        default=0.01,
+        metadata={"help": "L2 regularisation weight; reduces overfitting on small datasets."},
+    )
+    max_grad_norm: float = field(
+        default=1.0,
+        metadata={"help": "Gradient clipping max norm; prevents loss spikes on tiny datasets."},
+    )
+    # bf16 and fp16 are mutually exclusive — set at most one to True
     bf16: bool = field(default=True, metadata={"help": "Use bfloat16 (requires Ampere+ GPU)"})
     fp16: bool = field(default=False, metadata={"help": "Use fp16 (fallback for older GPUs)"})
     freeze_vision_audio: bool = field(
         default=True,
         metadata={"help": "Freeze vision/audio towers (text-only fine-tuning)"},
+    )
+    val_size: float = field(
+        default=0.1,
+        metadata={
+            "help": "Fraction of data to hold out as a validation set (0 disables). "
+                    "Enables per-epoch evaluation and best-checkpoint selection."
+        },
+    )
+    report_to: str = field(
+        default="none",
+        metadata={"help": "Experiment tracker: 'none', 'wandb', 'tensorboard', etc."},
     )
 
 
@@ -136,6 +156,12 @@ def load_jsonl(path: str) -> Dataset:
     if "text" in keys:
         # Already formatted
         texts = [r["text"] for r in records if "text" in r]
+        missing = len(records) - len(texts)
+        if missing:
+            logger.warning(
+                f"{missing}/{len(records)} records lacked a 'text' key and were skipped. "
+                "Check your JSONL for mixed schemas."
+            )
     elif "messages" in keys:
         # Chat-format — will be handled by apply_chat_template in SFTTrainer
         return Dataset.from_list(records)
@@ -167,6 +193,12 @@ def main():
     parser = HfArgumentParser(ScriptArguments)
     args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
 
+    # Mutual-exclusion guards
+    if args.load_in_4bit and args.load_in_8bit:
+        raise ValueError("Cannot use both --load_in_4bit and --load_in_8bit. Choose one.")
+    if args.bf16 and args.fp16:
+        raise ValueError("Cannot use both --bf16 and --fp16. Choose one.")
+
     # HF token
     token = args.hf_token or os.environ.get("HF_TOKEN")
     if token:
@@ -191,7 +223,7 @@ def main():
     logger.info(f"Loading tokenizer for {args.model_id} …")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id,
-        trust_remote_code=True,
+        trust_remote_code=True,  # Required for Gemma's custom tokenizer code
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -231,6 +263,21 @@ def main():
         logger.info("Dataset after rendering: %s", dataset)
 
     # ------------------------------------------------------------------ #
+    # Train / validation split
+    # ------------------------------------------------------------------ #
+    eval_dataset = None
+    if args.val_size > 0:
+        split = dataset.train_test_split(test_size=args.val_size, seed=42)
+        dataset = split["train"]
+        eval_dataset = split["test"]
+        logger.info(
+            "Split dataset: %d train / %d eval (val_size=%.0f%%)",
+            len(dataset),
+            len(eval_dataset),
+            args.val_size * 100,
+        )
+
+    # ------------------------------------------------------------------ #
     # Model
     # ------------------------------------------------------------------ #
     logger.info(f"Loading model {args.model_id} …")
@@ -250,12 +297,17 @@ def main():
         quant_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         logger.info("Using 8-bit quantisation.")
 
+    # Prefer Flash Attention 2 when installed (e.g. on H100); fall back to SDPA otherwise.
+    has_flash_attn = importlib.util.find_spec("flash_attn") is not None
+    attn_impl = "flash_attention_2" if has_flash_attn else "sdpa"
+    logger.info("Using attention implementation: %s", attn_impl)
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
         device_map="auto",
-        trust_remote_code=True,
-        attn_implementation="sdpa",
+        trust_remote_code=True,  # Required for Gemma's custom model code
+        attn_implementation=attn_impl,
         **quant_kwargs,
     )
 
@@ -291,6 +343,15 @@ def main():
     # ------------------------------------------------------------------ #
     # Training config
     # ------------------------------------------------------------------ #
+    # Use paged_adamw_32bit for QLoRA (4-bit/8-bit) to avoid OOM from fused AdamW
+    # requiring full-precision parameter states alongside quantized weights.
+    optim = (
+        "paged_adamw_32bit"
+        if (args.load_in_4bit or args.load_in_8bit)
+        else "adamw_torch_fused"
+    )
+    logger.info("Using optimizer: %s", optim)
+
     sft_config = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -301,18 +362,25 @@ def main():
         learning_rate=args.learning_rate,
         lr_scheduler_type="cosine",
         warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         bf16=args.bf16,
         fp16=args.fp16,
-        optim="adamw_torch_fused",
+        optim=optim,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=2,
         max_seq_length=args.max_seq_length,
-        packing=False,
+        # Pack multiple short examples into one context window to reduce padding waste.
+        # Safe here because messages are pre-rendered to flat 'text' strings before training.
+        packing=True,
         use_liger_kernel=False,   # Disabled — can cause CUDA illegal access on Gemma 4
         # After conversational prep, TRL stores tokenized strings in column "text"
         dataset_text_field="text",
-        report_to="none",
+        report_to=args.report_to,
+        # Evaluation — only active when eval_dataset is provided
+        eval_strategy="epoch" if eval_dataset is not None else "no",
+        load_best_model_at_end=eval_dataset is not None,
     )
 
     # ------------------------------------------------------------------ #
@@ -322,6 +390,7 @@ def main():
         model=model,
         args=sft_config,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
     )
 
